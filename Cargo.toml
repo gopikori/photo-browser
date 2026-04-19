@@ -1,0 +1,26 @@
+[package]
+name = "photo-browser"
+version = "0.1.0"
+edition = "2021"
+description = "A lightweight local web-based photo culler for reviewing, comparing, and deleting JPEG+RAW photos from a trip"
+license = "MIT"
+repository = "https://github.com/gopikori/photo-browser"
+homepage = "https://github.com/gopikori/photo-browser"
+readme = "README.md"
+keywords = ["photography", "photos", "raw", "jpeg", "culling"]
+categories = ["command-line-utilities", "multimedia::images"]
+authors = ["Gopi Kori"]
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "io-util"] }
+tower-http = { version = "0.5", features = ["fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["jpeg", "rayon"] }
+mime_guess = "2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

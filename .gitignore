@@ -1,0 +1,6 @@
+/target
+/_deleted
+/.thumb_cache
+.DS_Store
+*.swp
+*.swo
