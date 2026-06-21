@@ -60,6 +60,31 @@
   .toast { position:fixed; bottom:24px; left:50%; transform:translateX(-50%); background:#222; border:1px solid #444; padding:10px 18px; border-radius:6px; font-size:13px; z-index:1000; box-shadow:0 4px 16px rgba(0,0,0,0.4); }
   .toast.err { border-color: var(--danger); }
   kbd { background:#333; border:1px solid #555; border-radius:3px; padding:1px 5px; font-family:monospace; font-size:11px; }
+
+  /* welcome (no folder loaded) */
+  .welcome { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:16px; color:var(--muted); }
+  .welcome h2 { margin:0; color:var(--text); font-weight:600; }
+  .welcome p { margin:0; font-size:13px; max-width:420px; text-align:center; line-height:1.5; }
+  .welcome button { font-size:14px; padding:10px 20px; }
+
+  /* folder picker modal */
+  .modal-backdrop { position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:2000; display:none; align-items:center; justify-content:center; }
+  .modal { width:min(680px, 92vw); max-height:82vh; background:var(--panel); border:1px solid #3a3a3a; border-radius:10px; display:flex; flex-direction:column; box-shadow:0 12px 48px rgba(0,0,0,0.6); overflow:hidden; }
+  .modal-head { display:flex; align-items:center; gap:10px; padding:14px 16px; border-bottom:1px solid #333; }
+  .modal-head strong { font-size:15px; }
+  .modal-head .spacer { flex:1; }
+  .picker-path { display:flex; align-items:center; gap:10px; padding:10px 16px; background:var(--panel2); border-bottom:1px solid #333; }
+  .picker-path .cur { font-family:monospace; font-size:12px; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; direction:rtl; text-align:left; }
+  .picker-list { flex:1; overflow-y:auto; min-height:160px; }
+  .frow { display:flex; align-items:center; gap:10px; padding:9px 16px; border-bottom:1px solid #262626; cursor:pointer; }
+  .frow:hover { background:var(--panel2); }
+  .frow .ficon { font-size:16px; }
+  .frow .fname { flex:1; font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .frow .fcount { font-size:11px; color:var(--accent); background:rgba(255,184,107,0.12); padding:2px 8px; border-radius:10px; min-width:0; }
+  .frow .fcount.zero { color:var(--muted); background:#2a2a2a; }
+  .frow .open { font-size:12px; padding:4px 10px; }
+  .modal-foot { display:flex; align-items:center; gap:12px; padding:12px 16px; border-top:1px solid #333; }
+  .modal-foot .hint { font-size:12px; color:var(--muted); }
 </style>
 </head>
 <body>
@@ -69,6 +94,7 @@
   <span class="root" id="root-label"></span>
   <span class="count" id="count-label"></span>
   <span class="spacer"></span>
+  <button id="btn-open" class="primary">📁 Open folder</button>
   <button id="btn-grid">Grid</button>
   <button id="btn-single">Single</button>
   <button id="btn-compare" class="primary" disabled>Compare (0)</button>
@@ -79,7 +105,13 @@
 <main>
 
   <section class="view active" id="grid">
-    <div class="scroll">
+    <div class="welcome" id="welcome" style="display:none">
+      <h2>📷 No folder open</h2>
+      <p>Pick a folder of photos to start culling. Loose JPEGs, RAWs and videos
+         get sorted into <code>jpegs/</code>, <code>raws/</code> and <code>videos/</code> automatically.</p>
+      <button class="primary" id="welcome-open">📁 Choose a folder…</button>
+    </div>
+    <div class="scroll" id="grid-scroll">
       <div class="thumbs" id="thumbs"></div>
       <div class="empty" id="grid-empty" style="display:none">No photos found.</div>
     </div>
@@ -122,6 +154,26 @@
 
 </main>
 
+<div class="modal-backdrop" id="picker" style="display:none">
+  <div class="modal">
+    <div class="modal-head">
+      <strong>Open a photo folder</strong>
+      <span class="spacer"></span>
+      <button class="btn" id="picker-close">✕</button>
+    </div>
+    <div class="picker-path">
+      <button class="btn" id="picker-up" title="Up one level">↑ Up</button>
+      <span class="cur" id="picker-cur"></span>
+    </div>
+    <div class="picker-list" id="picker-list"></div>
+    <div class="modal-foot">
+      <span class="hint" id="picker-hint">Click a folder to go in · <kbd>Open</kbd> sorts &amp; loads it</span>
+      <span class="spacer" style="flex:1"></span>
+      <button class="btn primary" id="picker-select">Sort &amp; open this folder</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const state = {
   files: [],
@@ -129,6 +181,7 @@ const state = {
   selected: new Set(), // up to 2
   root: '',
   rawAvailable: false,
+  videoAvailable: false,
   rotations: new Map(), // filename -> angle in degrees (0|90|180|270)
 };
 
@@ -137,13 +190,108 @@ const $ = (id) => document.getElementById(id);
 async function loadPhotos() {
   const res = await fetch('/api/photos');
   const data = await res.json();
+  if (!data.loaded) {
+    showWelcome(true);
+    openPicker(); // prompt the user to choose a folder right away
+    return;
+  }
+  applyPhotos(data);
+}
+
+function showWelcome(on) {
+  $('welcome').style.display = on ? 'flex' : 'none';
+  $('grid-scroll').style.display = on ? 'none' : 'block';
+  if (on) {
+    $('root-label').textContent = '(no folder)';
+    $('count-label').textContent = '';
+  }
+}
+
+// Adopt a freshly loaded folder (from /api/photos or /api/open) into the UI.
+function applyPhotos(data) {
+  showWelcome(false);
   state.files = data.files;
   state.root = data.root;
   state.rawAvailable = data.raw_available;
+  state.videoAvailable = data.video_available;
+  state.selected.clear();
+  state.rotations.clear();
+  state.current = 0;
   $('root-label').textContent = state.root;
-  $('count-label').textContent = state.files.length + ' photos' + (state.rawAvailable ? ' (raws present)' : '');
+  $('count-label').textContent = state.files.length + ' photos'
+    + (state.rawAvailable ? ' · RAW' : '')
+    + (state.videoAvailable ? ' · video' : '');
   renderGrid();
+  updateSelectionUI();
   if (state.files.length > 0) renderSingle();
+  showView('grid');
+}
+
+// ---------- folder picker ----------
+let pickerPath = null;
+let pickerParent = null;
+
+function openPicker(path) {
+  $('picker').style.display = 'flex';
+  loadDir(path || null);
+}
+function closePicker() { $('picker').style.display = 'none'; }
+function pickerOpen() { return $('picker').style.display !== 'none'; }
+
+async function loadDir(path) {
+  const url = '/api/browse' + (path ? ('?path=' + encodeURIComponent(path)) : '');
+  let data;
+  try {
+    const res = await fetch(url);
+    data = await res.json();
+  } catch (e) { toast('Browse failed: ' + e.message, true); return; }
+  pickerPath = data.path;
+  pickerParent = data.parent;
+  $('picker-cur').textContent = data.path;
+  $('picker-up').disabled = !data.parent;
+  const list = $('picker-list');
+  list.innerHTML = '';
+  if (data.entries.length === 0) {
+    list.innerHTML = '<div class="empty">No subfolders here. Use “Sort &amp; open this folder”.</div>';
+    return;
+  }
+  data.entries.forEach(en => {
+    const row = document.createElement('div');
+    row.className = 'frow';
+    const badge = en.photos > 0
+      ? `<span class="fcount">${en.photos}</span>`
+      : `<span class="fcount zero">0</span>`;
+    row.innerHTML = `<span class="ficon">📁</span><span class="fname" title="${en.name}">${en.name}</span>${badge}<button class="btn open">Open ▸</button>`;
+    const goIn = () => loadDir(en.path);
+    row.querySelector('.fname').addEventListener('click', goIn);
+    row.querySelector('.ficon').addEventListener('click', goIn);
+    row.addEventListener('dblclick', goIn);
+    row.querySelector('.open').addEventListener('click', (e) => { e.stopPropagation(); openFolder(en.path); });
+    list.appendChild(row);
+  });
+}
+
+async function openFolder(path) {
+  const btn = $('picker-select');
+  btn.disabled = true;
+  toast('Sorting & opening…');
+  try {
+    const res = await fetch('/api/open', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path }),
+    });
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.error || 'open failed');
+    closePicker();
+    const r = data.report;
+    toast(`Sorted ${r.jpegs} JPEG · ${r.raws} RAW · ${r.videos} video → ${data.photos.files.length} photos`);
+    applyPhotos(data.photos);
+  } catch (e) {
+    toast('Open failed: ' + e.message, true);
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 function renderGrid() {
@@ -336,6 +484,12 @@ async function deletePhoto(name) {
 }
 
 // event wiring
+$('btn-open').addEventListener('click', () => openPicker(null));
+$('welcome-open').addEventListener('click', () => openPicker(null));
+$('picker-close').addEventListener('click', closePicker);
+$('picker-up').addEventListener('click', () => { if (pickerParent) loadDir(pickerParent); });
+$('picker-select').addEventListener('click', () => { if (pickerPath) openFolder(pickerPath); });
+$('picker').addEventListener('click', (e) => { if (e.target === $('picker')) closePicker(); });
 $('btn-grid').addEventListener('click', () => showView('grid'));
 $('btn-single').addEventListener('click', () => showView('single'));
 $('btn-compare').addEventListener('click', () => { if (state.selected.size === 2) showView('compare'); });
@@ -365,6 +519,7 @@ $('cmp-b-delete').addEventListener('click', () => {
 
 document.addEventListener('keydown', (e) => {
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+  if (pickerOpen()) { if (e.key === 'Escape') closePicker(); return; }
   if (e.key === 'ArrowRight') { next(); }
   else if (e.key === 'ArrowLeft') { prev(); }
   else if (e.key.toLowerCase() === 'g') { showView('grid'); }
