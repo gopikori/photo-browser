@@ -1,6 +1,6 @@
 use axum::{
     body::Body,
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::{header, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
@@ -66,10 +66,6 @@ fn ext_lower(p: &StdPath) -> String {
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase()
-}
-
-fn is_media_ext(ext: &str) -> bool {
-    JPEG_EXTS.contains(&ext) || RAW_EXTS.contains(&ext) || VIDEO_EXTS.contains(&ext)
 }
 
 fn find_subdir_ci(root: &StdPath, names: &[&str]) -> Option<PathBuf> {
@@ -205,7 +201,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = Router::new()
         .route("/", get(index))
-        .route("/api/browse", get(browse))
+        .route("/api/pick", post(pick_folder))
         .route("/api/open", post(open_folder))
         .route("/api/photos", get(list_photos))
         .route("/api/image/:name", get(serve_full))
@@ -233,89 +229,99 @@ fn current(state: &AppState) -> Option<Session> {
     state.session.read().unwrap().clone()
 }
 
-// ---------- folder browsing ----------
+// ---------- native folder picker ----------
 
-#[derive(Deserialize)]
-struct BrowseQuery {
+/// Pop the OS folder-picker dialog and return the chosen path, or `None` if the
+/// user cancels. Uses the platform's standard scripting hook so we don't take on
+/// a GUI dependency (osascript/zenity/kdialog/PowerShell are already present).
+fn pick_folder_native(start_dir: &StdPath) -> Result<Option<PathBuf>, String> {
+    let start = start_dir.display().to_string();
+
+    #[cfg(target_os = "macos")]
+    let out = {
+        let script = format!(
+            "POSIX path of (choose folder with prompt \"Pick a photo folder to cull\" default location POSIX file \"{}\")",
+            start.replace('\\', "\\\\").replace('"', "\\\"")
+        );
+        Command::new("osascript")
+            .args(["-e", &script])
+            .output()
+            .map_err(|e| format!("osascript failed: {e}"))?
+    };
+
+    #[cfg(target_os = "linux")]
+    let out = {
+        let zenity = Command::new("zenity")
+            .args([
+                "--file-selection",
+                "--directory",
+                "--title=Pick a photo folder to cull",
+            ])
+            .arg(format!("--filename={}/", start))
+            .output();
+        match zenity {
+            Ok(o) => o,
+            Err(_) => Command::new("kdialog")
+                .args(["--getexistingdirectory", &start])
+                .output()
+                .map_err(|e| {
+                    format!("no native folder dialog found (install zenity or kdialog): {e}")
+                })?,
+        }
+    };
+
+    #[cfg(target_os = "windows")]
+    let out = {
+        let script = format!(
+            "Add-Type -AssemblyName System.Windows.Forms; \
+             $d = New-Object System.Windows.Forms.FolderBrowserDialog; \
+             $d.Description = 'Pick a photo folder to cull'; \
+             $d.SelectedPath = '{}'; \
+             if ($d.ShowDialog() -eq 'OK') {{ Write-Output $d.SelectedPath }}",
+            start.replace('\'', "''")
+        );
+        Command::new("powershell")
+            .args(["-NoProfile", "-STA", "-Command", &script])
+            .output()
+            .map_err(|e| format!("powershell failed: {e}"))?
+    };
+
+    // User cancelled → non-zero exit or empty stdout. Treat both as "no pick".
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let picked = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if picked.is_empty() {
+        return Ok(None);
+    }
+    // macOS `choose folder` returns paths with a trailing slash; strip it.
+    let picked = picked.trim_end_matches('/').to_string();
+    Ok(Some(PathBuf::from(picked)))
+}
+
+#[derive(Serialize)]
+struct PickResponse {
+    ok: bool,
     path: Option<String>,
 }
 
-#[derive(Serialize)]
-struct DirEntryInfo {
-    name: String,
-    path: String,
-    photos: usize,
-}
-
-#[derive(Serialize)]
-struct BrowseResponse {
-    path: String,
-    parent: Option<String>,
-    home: String,
-    entries: Vec<DirEntryInfo>,
-}
-
-/// Count media files directly in `dir`, or in its `jpegs/` subfolder if already sorted.
-/// Cheap hint shown next to each folder in the picker.
-fn count_media(dir: &StdPath) -> usize {
-    let mut n = 0;
-    if let Ok(rd) = fs::read_dir(dir) {
-        for e in rd.flatten() {
-            if e.file_type().map(|t| t.is_file()).unwrap_or(false) && is_media_ext(&ext_lower(&e.path())) {
-                n += 1;
-            }
-        }
+async fn pick_folder() -> Response {
+    let start = default_browse_dir();
+    let res = tokio::task::spawn_blocking(move || pick_folder_native(&start)).await;
+    match res {
+        Ok(Ok(Some(p))) => Json(PickResponse {
+            ok: true,
+            path: Some(p.display().to_string()),
+        })
+        .into_response(),
+        Ok(Ok(None)) => Json(PickResponse {
+            ok: true,
+            path: None,
+        })
+        .into_response(),
+        Ok(Err(e)) => json_err(e),
+        Err(e) => json_err(format!("task failed: {e}")),
     }
-    if n == 0 {
-        if let Some(j) = find_subdir_ci(dir, &["jpegs", "jpeg", "jpg"]) {
-            if let Ok(rd) = fs::read_dir(&j) {
-                for e in rd.flatten() {
-                    if e.file_type().map(|t| t.is_file()).unwrap_or(false)
-                        && is_media_ext(&ext_lower(&e.path()))
-                    {
-                        n += 1;
-                    }
-                }
-            }
-        }
-    }
-    n
-}
-
-async fn browse(Query(q): Query<BrowseQuery>) -> Json<BrowseResponse> {
-    let dir = match q.path {
-        Some(p) if !p.is_empty() => PathBuf::from(p),
-        _ => default_browse_dir(),
-    };
-    let dir = dir.canonicalize().unwrap_or(dir);
-    let parent = dir.parent().map(|p| p.display().to_string());
-
-    let mut entries: Vec<DirEntryInfo> = Vec::new();
-    if let Ok(rd) = fs::read_dir(&dir) {
-        for e in rd.flatten() {
-            let name = e.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') {
-                continue; // skip hidden / dotfolders
-            }
-            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                let path = e.path();
-                let photos = count_media(&path);
-                entries.push(DirEntryInfo {
-                    name,
-                    path: path.display().to_string(),
-                    photos,
-                });
-            }
-        }
-    }
-    entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-
-    Json(BrowseResponse {
-        path: dir.display().to_string(),
-        parent,
-        home: home_dir().display().to_string(),
-        entries,
-    })
 }
 
 // ---------- open (sort + activate) ----------
