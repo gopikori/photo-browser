@@ -203,6 +203,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/", get(index))
         .route("/api/pick", post(pick_folder))
         .route("/api/open", post(open_folder))
+        .route("/api/rescan", post(rescan))
         .route("/api/photos", get(list_photos))
         .route("/api/image/:name", get(serve_full))
         .route("/api/thumb/:name", get(serve_thumb))
@@ -359,6 +360,32 @@ async fn open_folder(
     }
 
     // Sorting touches the filesystem — run it off the async runtime.
+    let built = tokio::task::spawn_blocking(move || build_session(&root)).await;
+    let (session, report) = match built {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return json_err(e),
+        Err(e) => return json_err(format!("task failed: {e}")),
+    };
+
+    let photos = photos_response(&session);
+    *state.session.write().unwrap() = Some(session);
+
+    Json(OpenResponse {
+        ok: true,
+        report,
+        photos,
+    })
+    .into_response()
+}
+
+/// Re-sort loose files in the current session's root and rebuild the photo list.
+/// Called from the ⟳ Refresh button after the user drops new JPEGs/RAWs into the folder.
+async fn rescan(State(state): State<Arc<AppState>>) -> Response {
+    let Some(session) = current(&state) else {
+        return json_err("no folder open");
+    };
+    let root = session.root.clone();
+
     let built = tokio::task::spawn_blocking(move || build_session(&root)).await;
     let (session, report) = match built {
         Ok(Ok(v)) => v,

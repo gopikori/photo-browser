@@ -77,6 +77,7 @@
   <span class="count" id="count-label"></span>
   <span class="spacer"></span>
   <button id="btn-open" class="primary">📁 Open folder</button>
+  <button id="btn-refresh" title="Re-sort & reload after adding photos">⟳ Refresh</button>
   <button id="btn-grid">Grid</button>
   <button id="btn-single">Single</button>
   <button id="btn-compare" class="primary" disabled>Compare (0)</button>
@@ -163,6 +164,8 @@ async function loadPhotos() {
 function showWelcome(on) {
   $('welcome').style.display = on ? 'flex' : 'none';
   $('grid-scroll').style.display = on ? 'none' : 'block';
+  const refresh = $('btn-refresh');
+  if (refresh) refresh.disabled = on;
   if (on) {
     $('root-label').textContent = '(no folder)';
     $('count-label').textContent = '';
@@ -409,9 +412,41 @@ async function deletePhoto(name) {
   }
 }
 
+async function rescan() {
+  if (!state.root) return;
+  const btn = $('btn-refresh');
+  btn.disabled = true;
+  const orig = btn.textContent;
+  btn.textContent = '⟳ …';
+  try {
+    const res = await fetch('/api/rescan', { method: 'POST' });
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.error || 'rescan failed');
+    const r = data.report;
+    const moved = r.jpegs + r.raws + r.videos;
+    const before = state.files.length;
+    applyPhotos(data.photos);
+    const after = state.files.length;
+    const delta = after - before;
+    const msg = moved > 0
+      ? `Sorted ${r.jpegs} JPEG · ${r.raws} RAW · ${r.videos} video → ${after} photos`
+      : (delta > 0 ? `+${delta} new photos → ${after} total`
+        : (delta < 0 ? `${delta} photos → ${after} total`
+        : `No new photos (${after} total)`));
+    toast(msg);
+  } catch (e) {
+    toast('Refresh failed: ' + e.message, true);
+  } finally {
+    btn.textContent = orig;
+    btn.disabled = !state.root;
+  }
+}
+
 // event wiring
 $('btn-open').addEventListener('click', pickAndOpen);
 $('welcome-open').addEventListener('click', pickAndOpen);
+$('btn-refresh').addEventListener('click', rescan);
+$('btn-refresh').disabled = true;
 $('btn-grid').addEventListener('click', () => showView('grid'));
 $('btn-single').addEventListener('click', () => showView('single'));
 $('btn-compare').addEventListener('click', () => { if (state.selected.size === 2) showView('compare'); });
